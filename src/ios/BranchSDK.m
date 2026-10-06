@@ -1,10 +1,26 @@
 #import "BranchSDK.h"
+#import <dispatch/dispatch.h>
+#include <math.h>
 
 NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
+NSString * const BranchSDKURLProcessedKey = @"BranchSDKURLProcessed";
+static NSURL *lastDeepLinkURL;
 
 @interface BranchSDK()
 
-@property (strong, nonatomic) NSString *deepLinkUrl;
+@property (strong, nonatomic) NSMutableArray *sessionRequests;
+@property (copy, nonatomic) NSString *activeSessionRequestIdentifier;
+@property (strong, nonatomic) dispatch_source_t sessionRequestTimer;
+@property (atomic, assign) NSUInteger sessionGeneration;
+@property (atomic, assign) BOOL sessionsDisposed;
+
++ (NSURL *)lastDeepLinkURL;
+- (void)enqueueSessionCommand:(CDVInvokedUrlCommand *)command forceNewSession:(BOOL)force url:(NSURL *)url;
+- (void)processNextSessionRequest;
+- (NSTimeInterval)sessionRequestTimeout;
+- (void)startTaggedSessionWithURL:(NSURL *)url identifier:(NSString *)identifier;
+- (void)finishSessionRequest:(NSString *)identifier params:(NSDictionary *)params error:(NSError *)error;
+- (void)invalidateSessionRequests;
 
 - (void)doShareLinkResponse:(int)callbackId sendResponse:(NSDictionary*)response;
 
@@ -15,30 +31,98 @@ NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
 - (void)pluginInitialize
 {
   self.branchUniversalObjArray = [[NSMutableArray alloc] init];
+  self.sessionRequests = [[NSMutableArray alloc] init];
   [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleOpenURLNotification:) name:CDVPluginHandleOpenURLNotification object:nil];
+}
+
+- (void)onReset
+{
+  [self invalidateSessionRequests];
+  [super onReset];
+}
+
+- (void)dispose
+{
+  self.sessionsDisposed = YES;
+  [self invalidateSessionRequests];
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [super dispose];
+}
+
+- (void)dealloc
+{
+  if (_sessionRequestTimer) {
+    dispatch_source_cancel(_sessionRequestTimer);
+  }
+}
+
+- (void)invalidateSessionRequests
+{
+  NSUInteger generation;
+  @synchronized (self) {
+    self.sessionGeneration += 1;
+    generation = self.sessionGeneration;
+  }
+  void (^invalidate)(void) = ^{
+    if (generation != self.sessionGeneration) {
+      return;
+    }
+    BOOL hasCurrentRequest = self.activeSessionRequestIdentifier && self.sessionRequests.count > 0 &&
+                             [self.sessionRequests[0][@"generation"] unsignedIntegerValue] == generation;
+    if (!hasCurrentRequest) {
+      if (self.sessionRequestTimer) {
+        dispatch_source_cancel(self.sessionRequestTimer);
+        self.sessionRequestTimer = nil;
+      }
+      self.activeSessionRequestIdentifier = nil;
+    }
+    for (NSUInteger index = self.sessionRequests.count; index > 0; index--) {
+      if ([self.sessionRequests[index - 1][@"generation"] unsignedIntegerValue] != generation) {
+        [self.sessionRequests removeObjectAtIndex:index - 1];
+      }
+    }
+    [self processNextSessionRequest];
+  };
+  if ([NSThread isMainThread]) {
+    invalidate();
+  } else {
+    dispatch_async(dispatch_get_main_queue(), invalidate);
+  }
 }
 
 - (void)handleOpenURLNotification:(NSNotification*)notification
 {
-    // Cordova posts object:url and userInfo:options. citeturn12view0
     NSURL *url = (NSURL *)notification.object;
     if (![url isKindOfClass:[NSURL class]]) {
         return;
     }
 
-    // Keep deepLinkUrl in sync (Android does this via intent.getData()).
-    self.deepLinkUrl = url.absoluteString;
-
-    NSDictionary *options = notification.userInfo;
-    if (![options isKindOfClass:[NSDictionary class]]) {
-        options = @{};
+    [BranchSDK recordDeepLinkURL:url];
+    NSDictionary *options = [notification.userInfo isKindOfClass:[NSDictionary class]] ? notification.userInfo : @{};
+    if (![options[BranchSDKURLProcessedKey] boolValue]) {
+        // Other Cordova integrations may post URLs without passing through our delegate.
+        [[Branch getInstance] application:[UIApplication sharedApplication] openURL:url options:options];
     }
-
-    // Branch recommends using this in application:openURL:options:. citeturn1view0
-    [[Branch getInstance] application:[UIApplication sharedApplication] openURL:url options:options];
 }
 
 #pragma mark - Private APIs
+
++ (void)recordDeepLinkURL:(NSURL *)url
+{
+  if ([url isKindOfClass:[NSURL class]] && url.scheme.length > 0) {
+    @synchronized ([BranchSDK class]) {
+      lastDeepLinkURL = [url copy];
+    }
+  }
+}
+
++ (NSURL *)lastDeepLinkURL
+{
+  @synchronized ([BranchSDK class]) {
+    return lastDeepLinkURL;
+  }
+}
+
 #pragma mark - Global Instance Accessors
 
 - (Branch *)getInstance
@@ -67,7 +151,7 @@ NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
 {
   NSString *arg = [command.arguments objectAtIndex:0];
   NSURL *url = [NSURL URLWithString:arg];
-  self.deepLinkUrl = [url absoluteString];
+  [BranchSDK recordDeepLinkURL:url];
 
   return [NSNumber numberWithBool:[[Branch getInstance] handleDeepLink:url]];
 }
@@ -76,7 +160,7 @@ NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
 {
   NSString *arg = [command.arguments objectAtIndex:0];
   NSURL *url = [NSURL URLWithString:arg];
-  self.deepLinkUrl = [url absoluteString];
+  [BranchSDK recordDeepLinkURL:url];
 
   return [NSNumber numberWithBool:[[Branch getInstance] handleDeepLinkWithNewSession:url]];
 }
@@ -108,16 +192,11 @@ NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
         if (userInfo) {
             userActivity.userInfo = userInfo;
         }
-        // Snippet inside your existing continueUserActivity:(CDVInvokedUrlCommand*)command
-        if ([userActivity.activityType isEqualToString:NSUserActivityTypeBrowsingWeb]) {
-            // Optional URL argument provided by JS (example: command.arguments[2])
-            if (command.arguments.count > 2 && [command.arguments[2] isKindOfClass:[NSString class]]) {
-                NSString *webURLString = (NSString *)command.arguments[2];
-                NSURL *webURL = [NSURL URLWithString:webURLString];
-                if (webURL) {
-                    userActivity.webpageURL = webURL;
-                    self.deepLinkUrl = webURL.absoluteString;
-                }
+        if ([activityType isEqualToString:NSUserActivityTypeBrowsingWeb] && optionalURLString.length > 0) {
+            NSURL *webURL = [NSURL URLWithString:optionalURLString];
+            if (webURL) {
+                userActivity.webpageURL = webURL;
+                [BranchSDK recordDeepLinkURL:webURL];
             }
         }
         [[Branch getInstance] continueUserActivity:userActivity];
@@ -135,151 +214,235 @@ NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
 
 - (void)initSession:(CDVInvokedUrlCommand*)command
 {
-  [[Branch getInstance] registerPluginName:@"CordovaIonic" version:pluginVersion];
-  [[Branch getInstance] initSessionWithLaunchOptions:nil andRegisterDeepLinkHandler:^(NSDictionary *params, NSError *error) {
-
-    NSString *resultString = nil;
-    CDVPluginResult *pluginResult = nil;
-
-    if (!error) {
-      if (params != nil && [params count] > 0) {
-
-        NSError *err;
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:params options:0 error:&err];
-
-        if (!jsonData) {
-          NSLog(@"Parsing Error: %@", [err localizedDescription]);
-          NSDictionary *errorDict = [NSDictionary dictionaryWithObjectsAndKeys:[err localizedDescription], @"error", nil];
-          NSData* errorJSON = [NSJSONSerialization dataWithJSONObject:errorDict options:NSJSONWritingPrettyPrinted error:&err];
-
-          resultString = [[NSString alloc] initWithData:errorJSON encoding:NSUTF8StringEncoding];
-          pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:resultString];
-        } else {
-          resultString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
-          pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:params];
-        }
-      }
-    }
-    else {
-      NSLog(@"Init Error: %@", [error localizedDescription]);
-
-      // We create a JSON string result, because we're getting an error if we directly return a string result.
-      NSDictionary *errorDict = [NSDictionary dictionaryWithObjectsAndKeys:[error localizedDescription], @"error", nil];
-      NSData* errorJSON = [NSJSONSerialization dataWithJSONObject:errorDict options:NSJSONWritingPrettyPrinted error:&error];
-
-      resultString = [[NSString alloc] initWithData:errorJSON encoding:NSUTF8StringEncoding];
-      pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:resultString];
-    }
-
-    if (command != nil) {
-      [self.commandDelegate sendPluginResult: pluginResult callbackId: command.callbackId];
-    }
-  }];
+  [self enqueueSessionCommand:command forceNewSession:NO url:nil];
 }
-
-#pragma mark - Minimal Helpers
-
-/// Builds a launchOptions dictionary using UIApplicationLaunchOptionsURLKey when `url` is present.
-/// Returns a non-nil dictionary in all cases.
-- (NSDictionary *)bnc_launchOptionsForURL:(NSURL * _Nullable)url
-{
-    if (url) {
-        return @{ UIApplicationLaunchOptionsURLKey: url };
-    }
-    return @{};
-}
-
 
 - (void)forceNewSession:(CDVInvokedUrlCommand*)command
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-
-        // 1) Resolve URL (prefer explicit arg[0], else self.deepLinkUrl)
-        NSString *explicitURLString = nil;
-        if (command.arguments.count > 0 && [command.arguments[0] isKindOfClass:[NSString class]]) {
-            explicitURLString = (NSString *)command.arguments[0];
-        }
-
-        NSString *urlString = (explicitURLString.length > 0) ? explicitURLString : self.deepLinkUrl;
-        NSURL *url = (urlString.length > 0) ? [NSURL URLWithString:urlString] : nil;
-
-        if (urlString.length > 0 && url == nil) {
-            CDVPluginResult *bad =
-                [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                  messageAsString:[NSString stringWithFormat:@"Invalid URL string: %@", urlString]];
-            [self.commandDelegate sendPluginResult:bad callbackId:command.callbackId];
-            return;
-        }
-
-        if (urlString.length > 0) {
-            self.deepLinkUrl = urlString; // keep in sync for future calls
-        }
-
-        Branch *branch = [Branch getInstance];
-        [branch registerPluginName:@"CordovaIonic" version:pluginVersion];
-
-        // 2) iOS analogue to Android "branch_force_new_session": reset init state. citeturn21view0turn2view3
-        [branch resetUserSession];
-
-        __block BOOL didSendResult = NO;
-        __block BOOL didTriggerDeepLink = NO;
-
-        // 3) Safety timeout: if Branch never returns, don't "do nothing".
-        NSTimeInterval timeoutSeconds = 5.0;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSeconds * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (didSendResult) return;
-
-            didSendResult = YES;
-            NSString *msg = @"Timed out waiting for Branch to resolve the new session. "
-                            @"Enable Branch logging and verify the app received the URL (scheme or Universal Link).";
-            CDVPluginResult *timeout =
-                [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:msg];
-            [self.commandDelegate sendPluginResult:timeout callbackId:command.callbackId];
-        });
-
-        // 4) Step A: initSession with EMPTY options to guarantee at least one callback
-        // because Branch will init/open when there is no URL/userActivity in launch options. citeturn5view0
-        [branch initSessionWithLaunchOptions:@{}
-                   andRegisterDeepLinkHandler:^(NSDictionary *params, NSError *error) {
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (didSendResult) return;
-
-                // Step B: on first callback, if we have a URL, force a new deep link session.
-                // Branch explicitly provides handleDeepLinkWithNewSession for this. citeturn21view1turn2view4
-                if (!didTriggerDeepLink && url != nil) {
-                    didTriggerDeepLink = YES;
-
-                    // This will clear current session data and attribute a new "open" per Branch warning. citeturn1view0
-                    [branch handleDeepLinkWithNewSession:url];
-
-                    // Return now; expect a second callback with the forced session’s params.
-                    return;
-                }
-
-                // If we get here, either:
-                // - there was no URL (just return whatever params we got), or
-                // - this is the post-handleDeepLink callback (return those params)
-                didSendResult = YES;
-
-                if (error) {
-                    NSString *msg = error.localizedDescription ?: @"Branch init session error (unknown).";
-                    CDVPluginResult *fail =
-                        [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:msg];
-                    [self.commandDelegate sendPluginResult:fail callbackId:command.callbackId];
-                    return;
-                }
-
-                NSDictionary *safeParams = (params && [params isKindOfClass:[NSDictionary class]]) ? params : @{};
-                CDVPluginResult *ok =
-                    [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:safeParams];
-                [self.commandDelegate sendPluginResult:ok callbackId:command.callbackId];
-            });
-        }];
-    });
+  NSURL *url = nil;
+  if (command.arguments.count > 0) {
+    id argument = command.arguments[0];
+    if ([argument isKindOfClass:[NSString class]]) {
+      url = [NSURL URLWithString:argument];
+    }
+    BOOL isWebURL = [url.scheme.lowercaseString isEqualToString:@"https"] ||
+                    [url.scheme.lowercaseString isEqualToString:@"http"];
+    if (url.scheme.length == 0 || (isWebURL && url.host.length == 0)) {
+      CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
+                                               messageAsString:@"Please provide a valid absolute URL"];
+      [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+      return;
+    }
+  }
+  [self enqueueSessionCommand:command forceNewSession:YES url:url];
 }
 
+#pragma mark - Session requests
+
+- (void)enqueueSessionCommand:(CDVInvokedUrlCommand *)command forceNewSession:(BOOL)force url:(NSURL *)url
+{
+  NSUInteger generation = self.sessionGeneration;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self.sessionsDisposed || generation != self.sessionGeneration) {
+      return;
+    }
+    NSURL *requestURL = url;
+    if (force) {
+      if (requestURL) {
+        [BranchSDK recordDeepLinkURL:requestURL];
+      } else {
+        requestURL = [BranchSDK lastDeepLinkURL];
+      }
+    }
+    NSDictionary *request = @{
+      @"command": command ?: [NSNull null],
+      @"force": @(force),
+      @"url": requestURL ?: [NSNull null],
+      @"identifier": [NSUUID UUID].UUIDString,
+      @"generation": @(generation)
+    };
+    [self.sessionRequests addObject:request];
+    [self processNextSessionRequest];
+  });
+}
+
+- (void)processNextSessionRequest
+{
+  if (self.sessionsDisposed || self.activeSessionRequestIdentifier || self.sessionRequests.count == 0) {
+    return;
+  }
+
+  NSDictionary *request = self.sessionRequests[0];
+  if ([request[@"generation"] unsignedIntegerValue] != self.sessionGeneration) {
+    return;
+  }
+  NSString *requestIdentifier = request[@"identifier"];
+  self.activeSessionRequestIdentifier = requestIdentifier;
+  BOOL force = [request[@"force"] boolValue];
+  NSURL *url = request[@"url"] == [NSNull null] ? nil : request[@"url"];
+  Branch *branch = [Branch getInstance];
+  [branch registerPluginName:@"CordovaIonic" version:pluginVersion];
+
+  __weak BranchSDK *weakSelf = self;
+  NSTimeInterval timeout = [self sessionRequestTimeout];
+  dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+  if (!timer) {
+    NSError *error = [NSError errorWithDomain:@"BranchCordovaSDK" code:4
+                                    userInfo:@{ NSLocalizedDescriptionKey: @"Unable to schedule this Branch session" }];
+    [self finishSessionRequest:requestIdentifier params:nil error:error];
+    return;
+  }
+  dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, NSEC_PER_SEC / 10);
+  dispatch_source_set_event_handler(timer, ^{
+    NSError *error = [NSError errorWithDomain:@"BranchCordovaSDK" code:1
+                                    userInfo:@{ NSLocalizedDescriptionKey: @"Timed out waiting for Branch to resolve this session. You can call forceNewSession again." }];
+    [weakSelf finishSessionRequest:requestIdentifier params:nil error:error];
+  });
+  self.sessionRequestTimer = timer;
+  dispatch_resume(timer);
+
+  // For forced calls, register without an automatic, untagged session first.
+  // Branch checks the presence of this key; a URL-less force is triggered below.
+  NSDictionary *launchOptions = force ? @{ UIApplicationLaunchOptionsURLKey: url ?: [NSNull null] } : @{};
+  @try {
+    // Release the SDK's plugin-runtime gate before installing this request's handler.
+    [branch notifyNativeToInit];
+    [branch initSceneSessionWithLaunchOptions:launchOptions
+                              isReferrable:YES
+             explicitlyRequestedReferrable:NO
+            automaticallyDisplayController:NO
+                   registerDeepLinkHandler:^(BNCInitSessionResponse *response, NSError *error) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        BranchSDK *plugin = weakSelf;
+        if (![plugin.activeSessionRequestIdentifier isEqualToString:requestIdentifier]) {
+          return;
+        }
+        if (!response) {
+          NSError *responseError = error ?: [NSError errorWithDomain:@"BranchCordovaSDK" code:2
+                                                           userInfo:@{ NSLocalizedDescriptionKey: @"Branch returned an empty session response" }];
+          [plugin finishSessionRequest:requestIdentifier params:nil error:responseError];
+          return;
+        }
+        // Ordinary initSession receives the current SDK session; forced calls
+        // must receive the response belonging to their own open.
+        BOOL matchesRequest = !force || [response.sceneIdentifier isEqualToString:requestIdentifier];
+        if (!matchesRequest) {
+          if (force && !url) {
+            // A URL-less open can be absorbed by an earlier pending SDK open.
+            // Once it completes, retry our own tagged open using the same deadline.
+            [plugin startTaggedSessionWithURL:nil identifier:requestIdentifier];
+          }
+          return;
+        }
+        [plugin finishSessionRequest:requestIdentifier params:response.params error:error];
+      });
+    }];
+
+    if (force) {
+      // This resets on every call, including repeated URLs and URL-less opens.
+      // The BOOL reports recognition; both recognized and other URLs can callback.
+      [self startTaggedSessionWithURL:url identifier:requestIdentifier];
+    }
+  }
+  @catch (NSException *exception) {
+    NSError *error = [NSError errorWithDomain:@"BranchCordovaSDK" code:3
+                                    userInfo:@{ NSLocalizedDescriptionKey: exception.reason ?: @"Branch could not start this session" }];
+    [self finishSessionRequest:requestIdentifier params:nil error:error];
+  }
+}
+
+- (void)startTaggedSessionWithURL:(NSURL *)url identifier:(NSString *)identifier
+{
+  if (self.sessionsDisposed || ![self.activeSessionRequestIdentifier isEqualToString:identifier] || self.sessionRequests.count == 0 ||
+      [self.sessionRequests[0][@"generation"] unsignedIntegerValue] != self.sessionGeneration) {
+    return;
+  }
+  if (!url && [[BNCServerRequestQueue getInstance] findExistingInstallOrOpen]) {
+    // A URL-less open would adopt the earlier request's callback. Wait until
+    // it leaves the SDK queue before creating our own tagged session.
+    __weak BranchSDK *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+      [weakSelf startTaggedSessionWithURL:nil identifier:identifier];
+    });
+    return;
+  }
+  @try {
+    [[Branch getInstance] handleDeepLink:url sceneIdentifier:identifier];
+  }
+  @catch (NSException *exception) {
+    NSError *error = [NSError errorWithDomain:@"BranchCordovaSDK" code:3
+                                    userInfo:@{ NSLocalizedDescriptionKey: exception.reason ?: @"Branch could not start this session" }];
+    [self finishSessionRequest:identifier params:nil error:error];
+  }
+}
+
+- (NSTimeInterval)sessionRequestTimeout
+{
+  BNCPreferenceHelper *preferences = [BNCPreferenceHelper sharedInstance];
+  NSTimeInterval networkTimeout = MAX(1.0, preferences.timeout);
+  double retries = MAX(0, preferences.retryCount);
+  NSTimeInterval retryInterval = MAX(0.0, preferences.retryInterval);
+  NSTimeInterval requestBudget = (retries + 1.0) * networkTimeout + retries * retryInterval;
+  // Allow an earlier SDK request plus our own retries and initialization work.
+  NSTimeInterval timeout = 2.0 * requestBudget + 15.0;
+  return isfinite(timeout) ? MAX(30.0, timeout) : 60.0;
+}
+
+- (void)finishSessionRequest:(NSString *)identifier params:(NSDictionary *)params error:(NSError *)error
+{
+  if (self.sessionsDisposed || ![self.activeSessionRequestIdentifier isEqualToString:identifier] || self.sessionRequests.count == 0 ||
+      ![self.sessionRequests[0][@"identifier"] isEqualToString:identifier] ||
+      [self.sessionRequests[0][@"generation"] unsignedIntegerValue] != self.sessionGeneration) {
+    return;
+  }
+
+  NSDictionary *request = self.sessionRequests[0];
+  CDVInvokedUrlCommand *command = request[@"command"] == [NSNull null] ? nil : request[@"command"];
+  BOOL force = [request[@"force"] boolValue];
+  if (self.sessionRequestTimer) {
+    dispatch_source_cancel(self.sessionRequestTimer);
+    self.sessionRequestTimer = nil;
+  }
+  [self.sessionRequests removeObjectAtIndex:0];
+  self.activeSessionRequestIdentifier = nil;
+
+  CDVPluginResult *result;
+  if (error) {
+    NSString *message = error.localizedDescription ?: @"Branch init session failed";
+    if (!force) {
+      // Preserve initSession's JSON error string for existing callers.
+      NSData *json = [NSJSONSerialization dataWithJSONObject:@{ @"error": message } options:0 error:NULL];
+      message = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    }
+    result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message];
+  } else {
+    NSDictionary *safeParams = [params isKindOfClass:[NSDictionary class]] ? params : @{};
+    id referringLink = safeParams[@"~referring_link"];
+    NSURL *referringURL = [referringLink isKindOfClass:[NSString class]] ? [NSURL URLWithString:referringLink] : nil;
+    if (referringURL.scheme.length > 0) {
+      if (![BranchSDK lastDeepLinkURL]) {
+        [BranchSDK recordDeepLinkURL:referringURL];
+      }
+      // Calls queued before deferred-link resolution can now replay that link.
+      for (NSUInteger index = 0; index < self.sessionRequests.count; index++) {
+        NSDictionary *pending = self.sessionRequests[index];
+        if ([pending[@"force"] boolValue] && pending[@"url"] == [NSNull null]) {
+          NSMutableDictionary *updated = [pending mutableCopy];
+          updated[@"url"] = referringURL;
+          self.sessionRequests[index] = updated;
+        }
+      }
+    }
+    result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:safeParams];
+  }
+  if (command) {
+    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+  }
+  // Let the SDK finish cleaning up the previous response before starting another.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self processNextSessionRequest];
+  });
+}
 
 - (void)setRequestMetadata:(CDVInvokedUrlCommand*)command
 {

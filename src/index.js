@@ -160,8 +160,26 @@ Branch.prototype.setIdentity = function setIdentity(identity) {
   return executeReject("Please set an identity");
 };
 
-Branch.prototype.forceNewSession = function forceNewSession() {
-  return execute("forceNewSession");
+Branch.prototype.forceNewSession = function forceNewSession(url) {
+  if (typeof url === "undefined") {
+    return execute("forceNewSession");
+  }
+
+  if (
+    typeof url !== "string" ||
+    !/^[a-z][a-z0-9+.-]*:/i.test(url) ||
+    /\s/.test(url)
+  ) {
+    return executeReject("Please set a valid absolute URL");
+  }
+
+  try {
+    new URL(url);
+  } catch (error) {
+    return executeReject("Please set a valid absolute URL");
+  }
+
+  return execute("forceNewSession", [url]);
 };
 
 Branch.prototype.logout = function logout() {

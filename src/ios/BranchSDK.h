@@ -16,6 +16,8 @@
 
 #import <Cordova/CDV.h>
 
+FOUNDATION_EXPORT NSString * const BranchSDKURLProcessedKey;
+
 @interface BranchSDK : CDVPlugin
 
 @property (copy) NSString *canonicalIdentifier;
@@ -28,6 +30,9 @@
 @property (copy) NSDate *expirationDate;
 
 @property (strong, nonatomic) NSMutableArray *branchUniversalObjArray;
+
+// Retain incoming URLs even when the app delegate runs before plugin initialization.
++ (void)recordDeepLinkURL:(NSURL *)url;
 
 // BranchSDK Basic Methods
 - (void)enableTestMode:(CDVInvokedUrlCommand*)command;
@@ -55,7 +60,7 @@
 // Branch Query Methods
 - (void)lastAttributedTouchData:(CDVInvokedUrlCommand *)command;
 
-// New force branch Method
+// Resolve the latest received link again, or an optional URL supplied by JavaScript.
 - (void)forceNewSession:(CDVInvokedUrlCommand *)command;
 
 
