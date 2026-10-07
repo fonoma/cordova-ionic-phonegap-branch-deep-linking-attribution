@@ -56,6 +56,9 @@ public class BranchSDK extends CordovaPlugin {
     private final Handler forcedSessionHandler = new Handler(Looper.getMainLooper());
     private boolean forcedSessionInProgress;
     private ForcedSessionRequest activeForcedSession;
+    private int pendingInitialSessions;
+    private String nativeLinkScheme;
+    private ArrayList<String> nativeLinkDomains;
 
     private static class ForcedSessionRequest {
         final Intent intent;
@@ -80,6 +83,13 @@ public class BranchSDK extends CordovaPlugin {
 
     }
 
+    @Override
+    public void onReset() {
+        nativeLinkScheme = null;
+        nativeLinkDomains = null;
+        super.onReset();
+    }
+
     /**
      * Called after plugin construction and fields have been initialized.
      */
@@ -99,21 +109,141 @@ public class BranchSDK extends CordovaPlugin {
      * Called when the activity receives a new intent.
      */
     public void onNewIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
         this.activity = this.cordova.getActivity();
-        cacheDeepLink(intent);
-        intent.putExtra("branch_force_new_session", true);
+        Uri url = deepLinkFromIntent(intent);
+        boolean handlesLink = nativeLinkScheme == null || isNativeBranchLink(url);
+        if (handlesLink) {
+            cacheDeepLink(intent);
+            intent.putExtra("branch_force_new_session", true);
+        }
         this.activity.setIntent(intent);
+        if (handlesLink && url != null && !intent.getBooleanExtra("branch_used", false)) {
+            notifyLinkOpened(url);
+        }
+    }
+
+    private void setNativeLinkHandling(JSONArray args, CallbackContext callbackContext) {
+        Object argument = args.length() == 1 ? args.opt(0) : null;
+        if (!(argument instanceof JSONObject)) {
+            callbackContext.error("Please provide a valid scheme and domains");
+            return;
+        }
+        JSONObject options = (JSONObject) argument;
+        Object scheme = options.opt("scheme");
+        Object domains = options.opt("domains");
+        if (!(scheme instanceof String) || !((String) scheme).matches("^[A-Za-z][A-Za-z0-9+.-]*$") ||
+                !(domains instanceof JSONArray)) {
+            callbackContext.error("Please provide a valid scheme and domains");
+            return;
+        }
+        ArrayList<String> normalizedDomains = new ArrayList<>();
+        JSONArray domainArray = (JSONArray) domains;
+        for (int index = 0; index < domainArray.length(); index++) {
+            Object domain = domainArray.opt(index);
+            if (!(domain instanceof String) || !((String) domain).matches("^[A-Za-z0-9.-]+$")) {
+                callbackContext.error("Please provide a valid scheme and domains");
+                return;
+            }
+            normalizedDomains.add(((String) domain).toLowerCase(java.util.Locale.ROOT));
+        }
+        nativeLinkScheme = ((String) scheme).toLowerCase(java.util.Locale.ROOT);
+        nativeLinkDomains = normalizedDomains;
+        // Native URLs are resolved by our queue, including after Activity restarts.
+        Branch.enableBypassCurrentActivityIntentState();
+        Branch.bypassWaitingForIntent(true);
+        callbackContext.success();
+    }
+
+    private boolean isNativeBranchLink(Uri url) {
+        if (url == null || nativeLinkScheme == null) {
+            return false;
+        }
+        String scheme = url.getScheme() == null ? "" : url.getScheme().toLowerCase(java.util.Locale.ROOT);
+        if (scheme.equals(nativeLinkScheme)) {
+            return true;
+        }
+        String host = url.getHost() == null ? "" : url.getHost().toLowerCase(java.util.Locale.ROOT);
+        if (!scheme.equals("http") && !scheme.equals("https")) {
+            return false;
+        }
+        return nativeLinkDomains.contains(host);
+    }
+
+    private Uri deepLinkFromIntent(Intent intent) {
+        Uri data = intent == null ? null : intent.getData();
+        if (intent != null && intent.getExtras() != null) {
+            Object branchLink = intent.getExtras().get("branch");
+            if (branchLink instanceof String || branchLink instanceof Uri) {
+                Uri branchUri = Uri.parse(branchLink.toString());
+                if (branchUri.getScheme() != null) {
+                    data = branchUri;
+                }
+            }
+        }
+        if (data == null || data.getScheme() == null) {
+            return null;
+        }
+        boolean isWebURL = "https".equalsIgnoreCase(data.getScheme()) ||
+                "http".equalsIgnoreCase(data.getScheme());
+        if (isWebURL && (data.getHost() == null || data.getHost().length() == 0)) {
+            return null;
+        }
+        return data;
     }
 
     private void cacheDeepLink(Intent intent) {
-        Uri data = intent == null ? null : intent.getData();
-        if (data == null && intent != null && intent.getExtras() != null) {
-            Object branchLink = intent.getExtras().get("branch");
-            if (branchLink instanceof String || branchLink instanceof Uri) {
-                data = Uri.parse(branchLink.toString());
+        // Branch strips scheme identifiers and marks the intent after consuming it.
+        if (intent != null && intent.getBooleanExtra("branch_used", false)) {
+            return;
+        }
+        Uri data = deepLinkFromIntent(intent);
+        if (data != null && (nativeLinkScheme == null || isNativeBranchLink(data))) {
+            this.deepLinkUrl = data.toString();
+        }
+    }
+
+    private void cacheReferringLink(JSONObject params) {
+        Object referringLink = params == null ? null : params.opt("~referring_link");
+        if (!(referringLink instanceof String)) {
+            return;
+        }
+        Uri url = deepLinkFromIntent(new Intent().setData(Uri.parse((String) referringLink)));
+        if (url == null) {
+            return;
+        }
+        if (this.deepLinkUrl == null) {
+            this.deepLinkUrl = url.toString();
+        }
+        // Only calls made before a URL was known receive deferred-link recovery.
+        // Explicit URLs and already-captured native/notification URLs stay intact.
+        for (ForcedSessionRequest pending : forcedSessionRequests) {
+            if (pending.intent.getData() == null) {
+                pending.intent.setData(url);
+                if ("https".equalsIgnoreCase(url.getScheme()) || "http".equalsIgnoreCase(url.getScheme())) {
+                    pending.intent.putExtra("branch", url.toString());
+                }
             }
         }
-        this.deepLinkUrl = data == null ? null : data.toString();
+    }
+
+    private void notifyLinkOpened(Uri url) {
+        if (this.webView == null || this.webView.getEngine() == null) {
+            return;
+        }
+        try {
+            JSONObject detail = new JSONObject();
+            detail.put("url", url.toString());
+            String jsonDetail = JSONObject.quote(detail.toString())
+                    .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029");
+            String script = "document.dispatchEvent(new CustomEvent('branch:linkOpened', {detail:JSON.parse(" +
+                    jsonDetail + ")}));";
+            this.webView.getEngine().evaluateJavascript(script, null);
+        } catch (JSONException error) {
+            Log.e(LCAT, "Unable to dispatch the Branch link-open event", error);
+        }
     }
 
     public boolean forceNewSession(JSONArray args, CallbackContext callbackContext) {
@@ -144,6 +274,10 @@ public class BranchSDK extends CordovaPlugin {
             }
 
         } else {
+            if (this.deepLinkUrl == null && pendingInitialSessions == 0 &&
+                    !forcedSessionInProgress && this.instance != null) {
+                cacheReferringLink(this.instance.getLatestReferringParams());
+            }
             // Use the latest requested URL, including one queued while another session is resolving.
             // The cached scheme URL also retains link_click_id after Branch consumes the intent.
             data = this.deepLinkUrl == null ? null : Uri.parse(this.deepLinkUrl);
@@ -173,7 +307,7 @@ public class BranchSDK extends CordovaPlugin {
     }
 
     private void startNextForcedSession() {
-        if (forcedSessionInProgress || forcedSessionRequests.isEmpty()) {
+        if (forcedSessionInProgress || pendingInitialSessions > 0 || forcedSessionRequests.isEmpty()) {
             return;
         }
         forcedSessionInProgress = true;
@@ -190,6 +324,17 @@ public class BranchSDK extends CordovaPlugin {
                 }
             };
             forcedSessionHandler.postDelayed(request.watchdog, forcedSessionTimeoutMillis());
+            // Enable manual intent handling after any earlier initial session completes.
+            // The SDK lifecycle must not consume a newer intent during this request.
+            Branch.enableBypassCurrentActivityIntentState();
+            Branch.bypassWaitingForIntent(true);
+            if (request.intent.getData() != null) {
+                // A failed SDK session retains identifiers; this captured URL owns the new request.
+                PrefHelper linkPreferences = PrefHelper.getInstance(activity.getApplicationContext());
+                linkPreferences.setLinkClickIdentifier(PrefHelper.NO_STRING_VALUE);
+                linkPreferences.setPushIdentifier(PrefHelper.NO_STRING_VALUE);
+                linkPreferences.setAppLink(PrefHelper.NO_STRING_VALUE);
+            }
             // Branch stores pending link identifiers globally; resolve one request at a time.
             Branch.sessionBuilder(activity)
                     .withData(request.intent.getData())
@@ -275,6 +420,9 @@ public class BranchSDK extends CordovaPlugin {
             cordova.getActivity().runOnUiThread(r);
             return true;
         } else if (action.equals("forceNewSession")) {
+            cordova.getActivity().runOnUiThread(r);
+            return true;
+        } else if (action.equals("setNativeLinkHandling")) {
             cordova.getActivity().runOnUiThread(r);
             return true;
         } else if (action.equals("setRequestMetadata")) {
@@ -414,14 +562,26 @@ public class BranchSDK extends CordovaPlugin {
 
         this.activity = this.cordova.getActivity();
 
-        Uri data = activity.getIntent().getData();
+        Intent intent = activity.getIntent();
+        Uri data = intent == null ? null : intent.getData();
 
-        if (data != null && data.isHierarchical() &&
-                !activity.getIntent().getBooleanExtra("branch_used", false)) {
-            this.deepLinkUrl = data.toString();
+        cacheDeepLink(intent);
+
+        pendingInitialSessions += 1;
+        try {
+            Branch.sessionBuilder(activity).withData(data).withCallback(new SessionListener(callbackContext, true)).init();
+        } catch (RuntimeException error) {
+            pendingInitialSessions -= 1;
+            if (callbackContext != null) {
+                callbackContext.error(error.getMessage() == null ? "Unable to start a Branch session" : error.getMessage());
+            }
+            forcedSessionHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    startNextForcedSession();
+                }
+            });
         }
-
-        Branch.sessionBuilder(activity).withData(data).withCallback(new SessionListener(callbackContext)).init();
     }
 
     /**
@@ -1008,9 +1168,16 @@ public class BranchSDK extends CordovaPlugin {
 
     protected class SessionListener implements Branch.BranchReferralInitListener {
         private CallbackContext _callbackContext;
+        private final boolean _initialSession;
+        private boolean _initialSessionCompleted;
 
         public SessionListener(CallbackContext callbackContext) {
+            this(callbackContext, false);
+        }
+
+        public SessionListener(CallbackContext callbackContext, boolean initialSession) {
             this._callbackContext = callbackContext;
+            this._initialSession = initialSession;
         }
 
         //Listener that implements BranchReferralInitListener for initSession
@@ -1020,6 +1187,7 @@ public class BranchSDK extends CordovaPlugin {
             String out;
 
             if (error == null) {
+                cacheReferringLink(referringParams);
                 if (this._callbackContext != null) {
                     this._callbackContext.success(referringParams == null ? new JSONObject() : referringParams);
                 }
@@ -1034,8 +1202,17 @@ public class BranchSDK extends CordovaPlugin {
                     this._callbackContext.error(message);
                 }
             }
-
-
+            if (this._initialSession && !this._initialSessionCompleted) {
+                this._initialSessionCompleted = true;
+                pendingInitialSessions -= 1;
+                // Let Branch complete startup cleanup before replaying a deferred URL.
+                forcedSessionHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        startNextForcedSession();
+                    }
+                });
+            }
         }
 
     }
@@ -1321,6 +1498,8 @@ public class BranchSDK extends CordovaPlugin {
                     disableTracking(this.args.getBoolean(0), this.callbackContext);
                 } else if (this.action.equals("forceNewSession")) {
                     forceNewSession(this.args, this.callbackContext);
+                } else if (this.action.equals("setNativeLinkHandling")) {
+                    setNativeLinkHandling(this.args, this.callbackContext);
                 } else if (this.action.equals("initSession")) {
                     initSession(this.callbackContext);
                 } else if (this.action.equals("setRequestMetadata")) {

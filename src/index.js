@@ -105,6 +105,18 @@ Branch.prototype.initSession = function initSession() {
   return execute("initSession");
 };
 
+// Opt in after registering the native link-open listener so it owns URL resolution.
+Branch.prototype.setNativeLinkHandling = function setNativeLinkHandling(options) {
+  if (!options || typeof options.scheme !== "string" ||
+      !/^[a-z][a-z0-9+.-]*$/i.test(options.scheme) ||
+      !Array.isArray(options.domains) || options.domains.some(function(domain) {
+        return typeof domain !== "string" || !/^[a-z0-9.-]+$/i.test(domain);
+      })) {
+    return executeReject("Please provide a valid scheme and domains");
+  }
+  return execute("setNativeLinkHandling", [options]);
+};
+
 Branch.prototype.setRequestMetadata = function setRequestMetadata(key, val) {
   if (!key || typeof key !== "string") {
     return executeReject("Please set key");

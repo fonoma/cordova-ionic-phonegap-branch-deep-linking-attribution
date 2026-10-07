@@ -4,23 +4,31 @@
 
 NSString * const pluginVersion = @"%BRANCH_PLUGIN_VERSION%";
 NSString * const BranchSDKURLProcessedKey = @"BranchSDKURLProcessed";
+NSString * const BranchSDKLinkOpenedNotification = @"BranchSDKLinkOpenedNotification";
 static NSURL *lastDeepLinkURL;
+static __weak BranchSDK *nativeLinkRouter;
 
 @interface BranchSDK()
 
 @property (strong, nonatomic) NSMutableArray *sessionRequests;
 @property (copy, nonatomic) NSString *activeSessionRequestIdentifier;
+@property (copy, nonatomic) NSString *scheduledSessionRequestIdentifier;
+@property (copy, nonatomic) NSString *startedSessionRequestIdentifier;
 @property (strong, nonatomic) dispatch_source_t sessionRequestTimer;
 @property (atomic, assign) NSUInteger sessionGeneration;
 @property (atomic, assign) BOOL sessionsDisposed;
+@property (copy, nonatomic) NSString *nativeLinkScheme;
+@property (copy, nonatomic) NSArray *nativeLinkDomains;
 
 + (NSURL *)lastDeepLinkURL;
 - (void)enqueueSessionCommand:(CDVInvokedUrlCommand *)command forceNewSession:(BOOL)force url:(NSURL *)url;
 - (void)processNextSessionRequest;
 - (NSTimeInterval)sessionRequestTimeout;
 - (void)startTaggedSessionWithURL:(NSURL *)url identifier:(NSString *)identifier;
+- (void)scheduleTaggedSessionWithURL:(NSURL *)url identifier:(NSString *)identifier;
 - (void)finishSessionRequest:(NSString *)identifier params:(NSDictionary *)params error:(NSError *)error;
 - (void)invalidateSessionRequests;
+- (BOOL)isNativeBranchLink:(NSURL *)url;
 
 - (void)doShareLinkResponse:(int)callbackId sendResponse:(NSDictionary*)response;
 
@@ -32,11 +40,15 @@ static NSURL *lastDeepLinkURL;
 {
   self.branchUniversalObjArray = [[NSMutableArray alloc] init];
   self.sessionRequests = [[NSMutableArray alloc] init];
+  nativeLinkRouter = self;
   [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleOpenURLNotification:) name:CDVPluginHandleOpenURLNotification object:nil];
+  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleNativeLinkOpenedNotification:) name:BranchSDKLinkOpenedNotification object:nil];
 }
 
 - (void)onReset
 {
+  self.nativeLinkScheme = nil;
+  self.nativeLinkDomains = nil;
   [self invalidateSessionRequests];
   [super onReset];
 }
@@ -44,6 +56,9 @@ static NSURL *lastDeepLinkURL;
 - (void)dispose
 {
   self.sessionsDisposed = YES;
+  if (nativeLinkRouter == self) {
+    nativeLinkRouter = nil;
+  }
   [self invalidateSessionRequests];
   [[NSNotificationCenter defaultCenter] removeObserver:self];
   [super dispose];
@@ -75,6 +90,8 @@ static NSURL *lastDeepLinkURL;
         self.sessionRequestTimer = nil;
       }
       self.activeSessionRequestIdentifier = nil;
+      self.scheduledSessionRequestIdentifier = nil;
+      self.startedSessionRequestIdentifier = nil;
     }
     for (NSUInteger index = self.sessionRequests.count; index > 0; index--) {
       if ([self.sessionRequests[index - 1][@"generation"] unsignedIntegerValue] != generation) {
@@ -97,12 +114,44 @@ static NSURL *lastDeepLinkURL;
         return;
     }
 
-    [BranchSDK recordDeepLinkURL:url];
+    [BranchSDK recordNativeDeepLinkURL:url];
     NSDictionary *options = [notification.userInfo isKindOfClass:[NSDictionary class]] ? notification.userInfo : @{};
     if (![options[BranchSDKURLProcessedKey] boolValue]) {
+        if ([BranchSDK routeNativeLinkURL:url]) {
+            return;
+        }
+        if ([BranchSDK nativeLinkHandlingEnabled]) {
+            // The Cordova notification still reaches other URL integrations.
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"BSDKPostUnhandledURL" object:url.absoluteString];
+            return;
+        }
         // Other Cordova integrations may post URLs without passing through our delegate.
         [[Branch getInstance] application:[UIApplication sharedApplication] openURL:url options:options];
+        [BranchSDK notifyLinkOpened:url];
     }
+}
+
+- (void)handleNativeLinkOpenedNotification:(NSNotification *)notification
+{
+  NSURL *url = notification.object;
+  if (![url isKindOfClass:[NSURL class]]) {
+    return;
+  }
+  NSUInteger generation = self.sessionGeneration;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self.sessionsDisposed || generation != self.sessionGeneration) {
+      return;
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{ @"url": url.absoluteString } options:0 error:NULL];
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!json) {
+      return;
+    }
+    json = [json stringByReplacingOccurrencesOfString:@"\u2028" withString:@"\\u2028"];
+    json = [json stringByReplacingOccurrencesOfString:@"\u2029" withString:@"\\u2029"];
+    NSString *script = [NSString stringWithFormat:@"document.dispatchEvent(new CustomEvent('branch:linkOpened', {detail:%@}));", json];
+    [self.commandDelegate evalJs:script];
+  });
 }
 
 #pragma mark - Private APIs
@@ -121,6 +170,64 @@ static NSURL *lastDeepLinkURL;
   @synchronized ([BranchSDK class]) {
     return lastDeepLinkURL;
   }
+}
+
++ (void)recordNativeDeepLinkURL:(NSURL *)url
+{
+  BranchSDK *plugin = nativeLinkRouter;
+  if (!plugin.nativeLinkScheme || [plugin isNativeBranchLink:url]) {
+    [BranchSDK recordDeepLinkURL:url];
+  }
+}
+
++ (BOOL)routeNativeLinkURL:(NSURL *)url
+{
+  BranchSDK *plugin = nativeLinkRouter;
+  if (!plugin || plugin.sessionsDisposed || ![plugin isNativeBranchLink:url]) {
+    return NO;
+  }
+  // The registered JavaScript listener queues the forced session. Do not let
+  // a native SDK open mutate shared link identifiers ahead of that queue.
+  [BranchSDK notifyLinkOpened:url];
+  return YES;
+}
+
++ (BOOL)nativeLinkHandlingEnabled
+{
+  BranchSDK *plugin = nativeLinkRouter;
+  return plugin && !plugin.sessionsDisposed && plugin.nativeLinkScheme != nil;
+}
+
+- (BOOL)isNativeBranchLink:(NSURL *)url
+{
+  if (!self.nativeLinkScheme || ![url isKindOfClass:[NSURL class]]) {
+    return NO;
+  }
+  NSString *scheme = url.scheme.lowercaseString;
+  if ([scheme isEqualToString:self.nativeLinkScheme]) {
+    return YES;
+  }
+  if (![scheme isEqualToString:@"https"] && ![scheme isEqualToString:@"http"]) {
+    return NO;
+  }
+  NSString *host = url.host.lowercaseString;
+  if (host.length == 0) {
+    return NO;
+  }
+  return [self.nativeLinkDomains containsObject:host];
+}
+
++ (void)notifyLinkOpened:(NSURL *)url
+{
+  if (![url isKindOfClass:[NSURL class]] || url.scheme.length == 0) {
+    return;
+  }
+  BranchSDK *plugin = nativeLinkRouter;
+  if (plugin.nativeLinkScheme && ![plugin isNativeBranchLink:url]) {
+    return;
+  }
+  [BranchSDK recordNativeDeepLinkURL:url];
+  [[NSNotificationCenter defaultCenter] postNotificationName:BranchSDKLinkOpenedNotification object:url];
 }
 
 #pragma mark - Global Instance Accessors
@@ -215,6 +322,42 @@ static NSURL *lastDeepLinkURL;
 - (void)initSession:(CDVInvokedUrlCommand*)command
 {
   [self enqueueSessionCommand:command forceNewSession:NO url:nil];
+}
+
+- (void)setNativeLinkHandling:(CDVInvokedUrlCommand *)command
+{
+  id options = command.arguments.count == 1 ? command.arguments[0] : nil;
+  id scheme = [options isKindOfClass:[NSDictionary class]] ? options[@"scheme"] : nil;
+  id domains = [options isKindOfClass:[NSDictionary class]] ? options[@"domains"] : nil;
+  NSPredicate *validScheme = [NSPredicate predicateWithFormat:@"SELF MATCHES %@", @"[A-Za-z][A-Za-z0-9+.-]*"];
+  NSPredicate *validDomain = [NSPredicate predicateWithFormat:@"SELF MATCHES %@", @"[A-Za-z0-9.-]+"];
+  BOOL valid = [scheme isKindOfClass:[NSString class]] && [validScheme evaluateWithObject:scheme] &&
+               [domains isKindOfClass:[NSArray class]];
+  NSMutableArray *normalizedDomains = [NSMutableArray array];
+  if (valid) {
+    for (id domain in domains) {
+      if (![domain isKindOfClass:[NSString class]] || ![validDomain evaluateWithObject:domain]) {
+        valid = NO;
+        break;
+      }
+      [normalizedDomains addObject:[domain lowercaseString]];
+    }
+  }
+  if (!valid) {
+    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Please provide a valid scheme and domains"];
+    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+    return;
+  }
+  NSUInteger generation = self.sessionGeneration;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self.sessionsDisposed || generation != self.sessionGeneration) {
+      return;
+    }
+    self.nativeLinkScheme = [scheme lowercaseString];
+    self.nativeLinkDomains = normalizedDomains;
+    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+  });
 }
 
 - (void)forceNewSession:(CDVInvokedUrlCommand*)command
@@ -327,10 +470,10 @@ static NSURL *lastDeepLinkURL;
         // must receive the response belonging to their own open.
         BOOL matchesRequest = !force || [response.sceneIdentifier isEqualToString:requestIdentifier];
         if (!matchesRequest) {
-          if (force && !url) {
-            // A URL-less open can be absorbed by an earlier pending SDK open.
-            // Once it completes, retry our own tagged open using the same deadline.
-            [plugin startTaggedSessionWithURL:nil identifier:requestIdentifier];
+          if (force) {
+            // A filtered URL or URL-less open can adopt an earlier SDK callback.
+            // Retry the original URL after the SDK queue drains, within this deadline.
+            [plugin scheduleTaggedSessionWithURL:url identifier:requestIdentifier];
           }
           return;
         }
@@ -357,16 +500,17 @@ static NSURL *lastDeepLinkURL;
       [self.sessionRequests[0][@"generation"] unsignedIntegerValue] != self.sessionGeneration) {
     return;
   }
-  if (!url && [[BNCServerRequestQueue getInstance] findExistingInstallOrOpen]) {
-    // A URL-less open would adopt the earlier request's callback. Wait until
-    // it leaves the SDK queue before creating our own tagged session.
-    __weak BranchSDK *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
-      [weakSelf startTaggedSessionWithURL:nil identifier:identifier];
-    });
+  if ([self.startedSessionRequestIdentifier isEqualToString:identifier] ||
+      [self.scheduledSessionRequestIdentifier isEqualToString:identifier]) {
+    return;
+  }
+  if ([[BNCServerRequestQueue getInstance] findExistingInstallOrOpen]) {
+    // Preserve one SDK open at a time, including filtered URLs and native opens.
+    [self scheduleTaggedSessionWithURL:url identifier:identifier];
     return;
   }
   @try {
+    self.startedSessionRequestIdentifier = identifier;
     [[Branch getInstance] handleDeepLink:url sceneIdentifier:identifier];
   }
   @catch (NSException *exception) {
@@ -374,6 +518,32 @@ static NSURL *lastDeepLinkURL;
                                     userInfo:@{ NSLocalizedDescriptionKey: exception.reason ?: @"Branch could not start this session" }];
     [self finishSessionRequest:identifier params:nil error:error];
   }
+}
+
+- (void)scheduleTaggedSessionWithURL:(NSURL *)url identifier:(NSString *)identifier
+{
+  if (self.sessionsDisposed || ![self.activeSessionRequestIdentifier isEqualToString:identifier] ||
+      [self.scheduledSessionRequestIdentifier isEqualToString:identifier]) {
+    return;
+  }
+  self.scheduledSessionRequestIdentifier = identifier;
+  __weak BranchSDK *weakSelf = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+    BranchSDK *plugin = weakSelf;
+    if (![plugin.scheduledSessionRequestIdentifier isEqualToString:identifier]) {
+      return;
+    }
+    plugin.scheduledSessionRequestIdentifier = nil;
+    if (plugin.sessionsDisposed || ![plugin.activeSessionRequestIdentifier isEqualToString:identifier]) {
+      return;
+    }
+    if ([[BNCServerRequestQueue getInstance] findExistingInstallOrOpen]) {
+      [plugin scheduleTaggedSessionWithURL:url identifier:identifier];
+      return;
+    }
+    plugin.startedSessionRequestIdentifier = nil;
+    [plugin startTaggedSessionWithURL:url identifier:identifier];
+  });
 }
 
 - (NSTimeInterval)sessionRequestTimeout
@@ -405,6 +575,8 @@ static NSURL *lastDeepLinkURL;
   }
   [self.sessionRequests removeObjectAtIndex:0];
   self.activeSessionRequestIdentifier = nil;
+  self.scheduledSessionRequestIdentifier = nil;
+  self.startedSessionRequestIdentifier = nil;
 
   CDVPluginResult *result;
   if (error) {
