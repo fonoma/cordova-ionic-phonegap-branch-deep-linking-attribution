@@ -16,6 +16,9 @@
 
 #import <Cordova/CDV.h>
 
+FOUNDATION_EXPORT NSString * const BranchSDKURLProcessedKey;
+FOUNDATION_EXPORT NSString * const BranchSDKLinkOpenedNotification;
+
 @interface BranchSDK : CDVPlugin
 
 @property (copy) NSString *canonicalIdentifier;
@@ -29,9 +32,18 @@
 
 @property (strong, nonatomic) NSMutableArray *branchUniversalObjArray;
 
+// Retain incoming URLs even when the app delegate runs before plugin initialization.
++ (void)recordDeepLinkURL:(NSURL *)url;
++ (void)recordNativeDeepLinkURL:(NSURL *)url;
++ (BOOL)routeNativeLinkURL:(NSURL *)url;
++ (BOOL)nativeLinkHandlingEnabled;
+// Notify an initialized WebView when a URL is opened through the native delegate.
++ (void)notifyLinkOpened:(NSURL *)url;
+
 // BranchSDK Basic Methods
 - (void)enableTestMode:(CDVInvokedUrlCommand*)command;
 - (void)initSession:(CDVInvokedUrlCommand*)command;
+- (void)setNativeLinkHandling:(CDVInvokedUrlCommand *)command;
 - (void)disableTracking:(CDVInvokedUrlCommand*)command;
 - (void)enableLogging:(CDVInvokedUrlCommand*)command;
 - (void)getAutoInstance:(CDVInvokedUrlCommand*)command;
@@ -54,6 +66,10 @@
 
 // Branch Query Methods
 - (void)lastAttributedTouchData:(CDVInvokedUrlCommand *)command;
+
+// Resolve the latest received link again, or an optional URL supplied by JavaScript.
+- (void)forceNewSession:(CDVInvokedUrlCommand *)command;
+
 
 
 @end
